@@ -348,6 +348,53 @@ class MailClient:
             raise MailError("No hay conexión IMAP activa; llama antes a connect()")
         return self._conn
 
+    def list_folders(self) -> list[str]:
+        """Lista las carpetas (etiquetas, en Gmail) del buzón.
+
+        En Gmail, un correo archivado o etiquetado NO está en ``INBOX``; vive
+        en ``[Gmail]/All Mail`` o en la carpeta de su etiqueta. Saber qué
+        carpetas hay es el primer paso cuando una búsqueda no encuentra nada.
+
+        Returns:
+            Los nombres de carpeta tal como los devuelve el servidor.
+
+        Raises:
+            MailError: Si el comando LIST falla.
+        """
+        conn = self._require_conn()
+        status, data = conn.list()
+        if status != "OK":
+            raise MailError(f"LIST falló: {data}")
+
+        folders = []
+        for raw in data or []:
+            if not isinstance(raw, bytes):
+                continue
+            line = raw.decode("utf-8", "replace")
+            # Formato: (\HasNoChildren) "/" "INBOX"  -> el nombre va al final.
+            name = line.rsplit(' "', 1)[-1].rstrip('"') if ' "' in line else line
+            folders.append(name)
+        return folders
+
+    def search(self, *criteria: str) -> list[str]:
+        """Ejecuta un ``UID SEARCH`` con los criterios dados.
+
+        Args:
+            *criteria: Criterios IMAP (p. ej. ``"UNSEEN"``, ``"FROM"``,
+                ``'"facebookmail.com"'``).
+
+        Returns:
+            Lista de UIDs IMAP como cadenas.
+
+        Raises:
+            MailError: Si el comando SEARCH falla.
+        """
+        conn = self._require_conn()
+        status, data = conn.uid("SEARCH", None, *criteria)
+        if status != "OK":
+            raise MailError(f"SEARCH falló: {data}")
+        return [uid.decode("ascii") for uid in (data[0] or b"").split()]
+
     def search_unread(self, sender_domain: str, unread_only: bool = True) -> list[str]:
         """Busca los UIDs de correos no leídos del dominio indicado.
 
@@ -362,23 +409,45 @@ class MailClient:
         Raises:
             MailError: Si el comando SEARCH falla.
         """
-        conn = self._require_conn()
         criteria = ["FROM", f'"{sender_domain}"']
         if unread_only:
             criteria.insert(0, "UNSEEN")
 
-        status, data = conn.uid("SEARCH", None, *criteria)
-        if status != "OK":
-            raise MailError(f"SEARCH falló: {data}")
-
-        uids = (data[0] or b"").split()
+        uids = self.search(*criteria)
         log_event(
             "imap_search",
             sender_domain=sender_domain,
             unread_only=unread_only,
+            folder=self.folder,
             found=len(uids),
         )
-        return [uid.decode("ascii") for uid in uids]
+        return uids
+
+    def fetch_headers(self, uid: str) -> Message:
+        """Descarga SÓLO las cabeceras de un mensaje, sin marcarlo como leído.
+
+        Mucho más rápido que traerse el mensaje entero; se usa para inspeccionar
+        buzones grandes.
+
+        Args:
+            uid: UID IMAP del mensaje.
+
+        Returns:
+            Un mensaje con las cabeceras ``From``, ``Subject`` y ``Date``.
+
+        Raises:
+            MailError: Si el FETCH falla.
+        """
+        conn = self._require_conn()
+        status, data = conn.uid(
+            "FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])"
+        )
+        if status != "OK":
+            raise MailError(f"FETCH de cabeceras falló para uid={uid}: {data}")
+        for item in data:
+            if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], bytes):
+                return email.message_from_bytes(item[1])
+        raise MailError(f"FETCH de cabeceras devolvió algo inesperado para uid={uid}")
 
     def fetch_raw(self, uid: str) -> Message:
         """Descarga un mensaje completo SIN marcarlo como leído.
@@ -535,6 +604,12 @@ if __name__ == "__main__":
     #   python src/mail.py --body          -> añade el cuerpo en texto plano
     #   python src/mail.py --limit 5       -> como mucho 5 correos
     #
+    # Diagnóstico, cuando la búsqueda no encuentra nada:
+    #   python src/mail.py --folders             -> lista las carpetas/etiquetas
+    #   python src/mail.py --folder "[Gmail]/All Mail" --all
+    #   python src/mail.py --from meta.com --all -> prueba otro remitente
+    #   python src/mail.py --recent 30           -> últimos 30 correos, sin filtrar
+    #
     # Pega la salida tal cual: de ahí sale el regex del act_id en la Fase 5.
     import argparse
     import os
@@ -549,14 +624,25 @@ if __name__ == "__main__":
     parser.add_argument("--body", action="store_true", help="volcar el cuerpo en texto plano")
     parser.add_argument("--limit", type=int, default=0, help="máximo de correos a volcar")
     parser.add_argument("--body-chars", type=int, default=2000, help="caracteres de cuerpo")
+    parser.add_argument("--folders", action="store_true", help="listar carpetas y salir")
+    parser.add_argument("--folder", default="", help="carpeta a inspeccionar (anula el .env)")
+    parser.add_argument(
+        "--from", dest="sender", default="", help="dominio del remitente (anula el .env)"
+    )
+    parser.add_argument(
+        "--recent",
+        type=int,
+        default=0,
+        help="volcar remitente y asunto de los N correos más recientes, sin filtrar",
+    )
     args = parser.parse_args()
 
     host = os.getenv("IMAP_HOST", "")
     port = int(os.getenv("IMAP_PORT", "993"))
     user = os.getenv("IMAP_USER", "")
     password = os.getenv("IMAP_PASSWORD", "")
-    folder = os.getenv("IMAP_FOLDER", "INBOX")
-    sender_domain = os.getenv("SENDER_DOMAIN", "facebookmail.com")
+    folder = args.folder or os.getenv("IMAP_FOLDER", "INBOX")
+    sender_domain = args.sender or os.getenv("SENDER_DOMAIN", "facebookmail.com")
 
     if not (host and user and password):
         print(
@@ -568,7 +654,31 @@ if __name__ == "__main__":
 
     client = MailClient(host, port, user, password, folder)
     try:
+        if args.folders:
+            # Sólo hay que estar autenticado; la carpeta da igual.
+            client.connect(readonly=True)
+            for name in client.list_folders():
+                log_event("folder", name=name)
+            raise SystemExit(0)
+
         client.connect(readonly=True)
+
+        if args.recent > 0:
+            # Sin filtrar por remitente: sirve para descubrir de qué dirección
+            # llegan realmente las facturas cuando la búsqueda no da nada.
+            todos = client.search("ALL")
+            log_event("mailbox_size", folder=folder, total=len(todos))
+            for message_uid in todos[-args.recent :]:
+                cabeceras = client.fetch_headers(message_uid)
+                log_event(
+                    "recent",
+                    uid=message_uid,
+                    sender=decode_mime_header(cabeceras.get("From")),
+                    subject=decode_mime_header(cabeceras.get("Subject")),
+                    date=cabeceras.get("Date", ""),
+                )
+            raise SystemExit(0)
+
         uids = client.search_unread(sender_domain, unread_only=not args.all)
         if args.limit > 0:
             uids = uids[: args.limit]
