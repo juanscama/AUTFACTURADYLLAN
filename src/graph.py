@@ -172,7 +172,10 @@ class GraphClient:
 
         result = app.acquire_token_by_device_flow(flow)
         if "access_token" in result:
-            log_event("auth_device_code_ok")
+            # Se loguea la cuenta que ha iniciado sesión: cuando la app está
+            # registrada en una cuenta y el OneDrive de destino es otra, es
+            # fácil autenticarse con la equivocada y no notarlo.
+            log_event("auth_device_code_ok", account=_account_from(result))
         return result
 
     # -- Subida -------------------------------------------------------------
@@ -315,6 +318,30 @@ class GraphClient:
             f"Graph {last_status} en {remote_path}: agotados {MAX_ATTEMPTS} intentos"
         )
 
+    def describe_drive(self) -> dict:
+        """Devuelve quién es el dueño del OneDrive al que se está subiendo.
+
+        Sólo informativo: sirve para confirmar que el device code flow se hizo
+        con la cuenta correcta cuando la app está registrada en otra distinta.
+
+        Returns:
+            Un dict con ``owner`` y ``drive_id``, con valores ``None`` si Graph
+            no devolvió esa información.
+        """
+        response = self._http.get(
+            f"{GRAPH_BASE_URL}/me/drive",
+            headers={"Authorization": f"Bearer {self.acquire_token()}"},
+        )
+        if response.status_code != 200:
+            return {"owner": None, "drive_id": None, "http_status": response.status_code}
+        payload = _safe_json(response) or {}
+        user = (payload.get("owner") or {}).get("user") or {}
+        return {
+            "owner": user.get("email") or user.get("displayName"),
+            "drive_id": payload.get("id"),
+            "http_status": 200,
+        }
+
     def close(self) -> None:
         """Cierra el cliente HTTP si es propio de esta instancia."""
         if self._owns_http:
@@ -325,6 +352,20 @@ class GraphClient:
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
+
+
+def _account_from(result: dict) -> str | None:
+    """Extrae el identificador de la cuenta autenticada de un resultado MSAL.
+
+    Args:
+        result: Diccionario devuelto por MSAL al adquirir un token.
+
+    Returns:
+        El ``preferred_username`` (o el email) de las claims del id_token, o
+        ``None`` si no vinieran.
+    """
+    claims = result.get("id_token_claims") or {}
+    return claims.get("preferred_username") or claims.get("email")
 
 
 def _safe_json(response: httpx.Response) -> dict | None:
@@ -391,6 +432,8 @@ if __name__ == "__main__":
 
     with GraphClient(client_id, tenant_id, cache_path) as graph_client:
         try:
+            # Confirma a qué OneDrive se está subiendo antes de tocar nada.
+            log_event("drive", **graph_client.describe_drive())
             outcome = graph_client.upload_file(payload, destination)
         except GraphError as err:
             log_event("test_upload_error", error=str(err))
