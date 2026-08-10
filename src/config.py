@@ -8,7 +8,10 @@ FASE 1: sólo firmas y docstrings. Sin lógica.
 
 from __future__ import annotations
 
+import json
+import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 
 @dataclass(frozen=True)
@@ -89,4 +92,9 @@ def log_event(event: str, **fields: object) -> None:
         event: Nombre corto del evento (``"skipped"``, ``"uploaded"``, ...).
         **fields: Campos adicionales serializables a JSON.
     """
-    raise NotImplementedError("Fase 1: stub")
+    record: dict[str, object] = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "event": event,
+    }
+    record.update(fields)
+    print(json.dumps(record, ensure_ascii=False, default=str), file=sys.stdout, flush=True)
