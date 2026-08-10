@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meta-invoices"
+version = "0.1.0"
+description = "Descarga facturas PDF de Meta Ads desde el correo y las sube a OneDrive de forma secuencial e idempotente."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "msal>=1.28",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+meta-invoices = "main:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["config", "graph", "ledger", "mail", "main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
